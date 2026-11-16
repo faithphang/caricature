@@ -107,6 +107,7 @@
 
     <div class="sep"></div>
 
+    <label class="check"><input type="checkbox" id="bgRemove" checked> Remove background (keeps people)</label>
     <label class="check"><input type="checkbox" id="orig"> Show original photo</label>
     <label class="check"><input type="checkbox" id="transp"> Transparent background</label>
 
@@ -118,6 +119,37 @@
   </div>
 </div>
 
+<script type="module">
+// On-device person segmentation (MediaPipe). Loads once, runs locally, no API key.
+const V = "0.10.14";
+const BASE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${V}`;
+const MODEL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite";
+let segP = null;
+function getSeg() {
+  if (!segP) {
+    segP = (async () => {
+      const { ImageSegmenter, FilesetResolver } = await import(`${BASE}/vision_bundle.mjs`);
+      const fileset = await FilesetResolver.forVisionTasks(`${BASE}/wasm`);
+      return ImageSegmenter.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: MODEL },
+        runningMode: "IMAGE",
+        outputConfidenceMasks: true,
+        outputCategoryMask: false
+      });
+    })();
+    segP.catch(() => { segP = null; });
+  }
+  return segP;
+}
+window.personMask = async (canvas) => {
+  const seg = await getSeg();
+  const res = seg.segment(canvas);
+  const m = res.confidenceMasks[0]; // class 0 = background
+  const out = { bg: m.getAsFloat32Array().slice(), mw: m.width, mh: m.height };
+  if (res.close) res.close();
+  return out;
+};
+</script>
 <script>
 (() => {
   const $ = id => document.getElementById(id);
@@ -166,13 +198,42 @@
     const g = new Float32Array(w * h);
     for (let i = 0; i < w * h; i++) g[i] = 0.299 * d[i*4] + 0.587 * d[i*4+1] + 0.114 * d[i*4+2];
     stretch(g);
-    Object.assign(S, { img: c, w, h, gray: g, origCanvas: c, cx: 0.5, cy: 0.38 });
+    Object.assign(S, { img: c, w, h, gray: g, origCanvas: c, cx: 0.5, cy: 0.38, mask: null, bin: null });
     view.width = w; view.height = h;
     view.hidden = false; $('empty').hidden = true; $('hint').hidden = false;
     $('dlPng').disabled = false; $('dlSvg').disabled = false;
     $('msg').textContent = '';
-    schedule();
+    vctx.drawImage(c, 0, 0);
+    computeMask().then(schedule);
   }
+
+  // ---------- background removal (on-device person segmentation) ----------
+  let maskJob = 0;
+  async function computeMask() {
+    const job = ++maskJob;
+    S.mask = null;
+    if (!$('bgRemove').checked || !S.origCanvas) return;
+    if (!window.personMask) { $('msg').textContent = "Background remover isn't available here."; return; }
+    $('busy').textContent = 'Finding subject…'; $('busy').classList.add('on');
+    try {
+      const { bg, mw, mh } = await window.personMask(S.origCanvas);
+      if (job !== maskJob) return;
+      const { w, h } = S, m = new Float32Array(w * h);
+      let n = 0;
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const v = 1 - sample(bg, mw, mh, (x + 0.5) * mw / w - 0.5, (y + 0.5) * mh / h - 0.5);
+        m[y * w + x] = v; if (v > 0.5) n++;
+      }
+      if (n < w * h * 0.01) { $('msg').textContent = 'No person found, so the whole photo was kept.'; return; }
+      S.mask = blur(m, w, h, 1.2);
+    } catch (e) {
+      console.error(e);
+      $('msg').textContent = "Couldn't load the background remover (it needs internet the first time).";
+    } finally {
+      $('busy').textContent = 'Drawing…';
+    }
+  }
+  $('bgRemove').addEventListener('change', () => { if (S.img) computeMask().then(schedule); });
 
   // ---------- webcam ----------
   let stream = null;
@@ -325,12 +386,28 @@
     const detail = +$('detail').value, weight = +$('weight').value, smooth = +$('smooth').value;
     const clean = +$('clean').value, exag = +$('exag').value / 100, radius = +$('radius').value / 100;
 
-    const g = warp(S.gray, w, h, S.cx, S.cy, exag, radius);
+    let base = S.gray;
+    if (S.mask) { // paint the background white
+      base = new Float32Array(w * h);
+      for (let i = 0; i < w * h; i++) base[i] = S.gray[i] * S.mask[i] + 255 * (1 - S.mask[i]);
+    }
+    const g = warp(base, w, h, S.cx, S.cy, exag, radius);
     const g1 = blur(g, w, h, smooth * 0.8);
     const g2 = blur(g, w, h, smooth * 0.8 * 1.8);
     const t = 14 - detail * 1.3; // detail 1 -> 12.7, 10 -> 1
     const bin = new Uint8Array(w * h);
     for (let i = 0; i < w * h; i++) bin[i] = (g2[i] - g1[i]) > t ? 1 : 0;
+
+    if (S.mask) {
+      const m = warp(S.mask, w, h, S.cx, S.cy, exag, radius);
+      for (let i = 0; i < w * h; i++) if (m[i] < 0.5) bin[i] = 0; // drop background lines
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { // bold silhouette outline
+        const i = y * w + x;
+        if (m[i] < 0.5) continue;
+        if ((x > 0 && m[i - 1] < 0.5) || (x < w - 1 && m[i + 1] < 0.5) ||
+            (y > 0 && m[i - w] < 0.5) || (y < h - 1 && m[i + w] < 0.5)) bin[i] = 1;
+      }
+    }
 
     removeSpecks(bin, w, h, clean);
     dilate(bin, w, h, weight * 0.75);
